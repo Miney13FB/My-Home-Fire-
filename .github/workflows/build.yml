@@ -44,12 +44,32 @@ jobs:
                   applicationId 'dev.homeredirect'
                   minSdk 21
                   targetSdk 34
-                  versionCode 3
-                  versionName '1.2'
+                  versionCode 4
+                  versionName '1.3'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
                   targetCompatibility JavaVersion.VERSION_1_8
+              }
+              signingConfigs {
+                  main {
+                      storeFile file('my.p12')
+                      storePassword 'android'
+                      keyAlias 'key'
+                      keyPassword 'android'
+                      storeType 'pkcs12'
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                      signingConfig signingConfigs.main
+                  }
+              }
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
               }
           }
           EOF
@@ -76,7 +96,11 @@ jobs:
                   android:icon="@android:drawable/sym_def_app_icon"
                   android:banner="@android:drawable/sym_def_app_icon"
                   android:allowBackup="false">
-                  <activity android:name=".MainActivity" android:exported="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:process=":ui"
+                      android:excludeFromRecents="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
@@ -121,65 +145,56 @@ jobs:
               android:description="@string/service_desc" />
           EOF
 
-          cat > app/src/main/java/dev/homeredirect/BootReceiver.java <<'EOF'
+          cat > app/src/main/java/dev/homeredirect/Cfg.java <<'EOF'
           package dev.homeredirect;
           
-          import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
-          import android.content.SharedPreferences;
-          
-          public class BootReceiver extends BroadcastReceiver {
-              @Override public void onReceive(Context c, Intent i) {
-                  SharedPreferences s = HomeService.sp(c);
-                  if (!s.getBoolean("boot", false)) return;
-                  Intent l = HomeService.launchIntent(c, s.getString("target", null));
-                  if (l == null) return;
-                  try { c.startActivity(l); } catch (Exception ignored) { }
-              }
-          }
-          EOF
-
-          cat > app/src/main/java/dev/homeredirect/HomeService.java <<'EOF'
-          package dev.homeredirect;
-          
-          import android.accessibilityservice.AccessibilityService;
-          import android.content.Context;
-          import android.content.Intent;
-          import android.content.SharedPreferences;
           import android.content.pm.PackageManager;
-          import android.graphics.PixelFormat;
-          import android.os.Build;
-          import android.os.Handler;
-          import android.os.Looper;
-          import android.view.Gravity;
-          import android.view.WindowManager;
-          import android.view.accessibility.AccessibilityEvent;
-          import android.widget.LinearLayout;
-          import android.widget.ProgressBar;
-          import android.widget.TextView;
           
-          /**
-           * Cuando el launcher de Amazon pasa a primer plano viniendo de otra app (= pulsaste Home),
-           * abre el launcher elegido. No lee el contenido de la pantalla.
-           */
-          public class HomeService extends AccessibilityService {
-              static final String AMAZON = "com.amazon.tv.launcher";
-              private static final long COVER_MAX_MS = 8000;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+          import java.io.FileWriter;
           
-              static volatile HomeService instance;
-              static volatile String lastInfo;
+          /** Configuración en un archivo diminuto: se comparte entre procesos sin SharedPreferences. */
+          final class Cfg {
+              String target;
+              boolean redirect = true;
+              boolean boot;
           
-              private final Handler h = new Handler(Looper.getMainLooper());
-              private final Runnable hideCover = this::removeCover;
-              private String target;
-              private Intent launch;
-              private boolean redirect = true;
-              private String fg;
-              private LinearLayout cover;
+              static File file(Context c) { return new File(c.getFilesDir(), "cfg"); }
           
-              static SharedPreferences sp(Context c) {
-                  return c.getSharedPreferences("p", Context.MODE_PRIVATE);
+              static Cfg read(Context c) {
+                  Cfg r = new Cfg();
+                  try (BufferedReader br = new BufferedReader(new FileReader(file(c)))) {
+                      String t = br.readLine();
+                      if (t != null && !t.isEmpty()) r.target = t;
+                      r.redirect = !"0".equals(br.readLine());
+                      r.boot = "1".equals(br.readLine());
+                  } catch (Exception ignored) { }
+                  return r;
+              }
+          
+              static void write(Context c, String target, boolean redirect, boolean boot) {
+                  File t = new File(c.getFilesDir(), "cfg.tmp");
+                  try (FileWriter w = new FileWriter(t)) {
+                      w.write((target == null ? "" : target) + "\n"
+                              + (redirect ? "1" : "0") + "\n" + (boot ? "1" : "0") + "\n");
+                  } catch (Exception e) { return; }
+                  t.renameTo(file(c));
+              }
+          
+              static String readLast(Context c) {
+                  try (BufferedReader br = new BufferedReader(new FileReader(new File(c.getFilesDir(), "last")))) {
+                      return br.readLine();
+                  } catch (Exception e) { return null; }
+              }
+          
+              static void writeLast(Context c, String s) {
+                  try (FileWriter w = new FileWriter(new File(c.getFilesDir(), "last"))) {
+                      w.write(s);
+                  } catch (Exception ignored) { }
               }
           
               static Intent launchIntent(Context c, String pkg) {
@@ -194,22 +209,71 @@ jobs:
                   }
                   return i;
               }
+          }
+          EOF
+
+          cat > app/src/main/java/dev/homeredirect/BootReceiver.java <<'EOF'
+          package dev.homeredirect;
           
-              static void refresh() {
-                  HomeService s = instance;
-                  if (s != null) s.reload();
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          
+          public class BootReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context c, Intent i) {
+                  Cfg cfg = Cfg.read(c);
+                  if (!cfg.boot) return;
+                  Intent l = Cfg.launchIntent(c, cfg.target);
+                  if (l == null) return;
+                  try { c.startActivity(l); } catch (Exception ignored) { }
               }
+          }
+          EOF
+
+          cat > app/src/main/java/dev/homeredirect/HomeService.java <<'EOF'
+          package dev.homeredirect;
           
-              @Override protected void onServiceConnected() {
-                  instance = this;
-                  reload();
-              }
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Intent;
+          import android.graphics.PixelFormat;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.WindowManager;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.TextView;
           
+          /**
+           * Cuando el launcher de Amazon pasa a primer plano viniendo de otra app (= pulsaste Home),
+           * abre el launcher elegido. No lee el contenido de la pantalla. Este proceso no carga
+           * nada de la interfaz de configuración (esa vive en otro proceso que se cierra solo).
+           */
+          public class HomeService extends AccessibilityService {
+              static final String AMAZON = "com.amazon.tv.launcher";
+              private static final long COVER_MAX_MS = 8000;
+          
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private final Runnable hideCover = this::removeCover;
+              private String target, fg, lastCls;
+              private Intent launch;
+              private boolean redirect = true;
+              private long stamp = -1;
+              private LinearLayout cover;
+          
+              @Override protected void onServiceConnected() { reload(); }
+          
+              /** Relee la configuración solo si el archivo cambió. */
               private void reload() {
-                  SharedPreferences s = sp(this);
-                  target = s.getString("target", null);
-                  redirect = s.getBoolean("redirect", true);
-                  launch = launchIntent(this, target);   // se resuelve una sola vez
+                  long m = Cfg.file(this).lastModified();
+                  if (m == stamp) return;
+                  stamp = m;
+                  Cfg c = Cfg.read(this);
+                  target = c.target;
+                  redirect = c.redirect;
+                  launch = Cfg.launchIntent(this, target);
               }
           
               @Override public void onAccessibilityEvent(AccessibilityEvent e) {
@@ -228,21 +292,23 @@ jobs:
                   if (cls.startsWith("android.") || cls.startsWith("androidx.")
                           || pkg.equals("com.android.systemui") || pkg.equals("android")) return;
           
-                  boolean enteredAmazon = pkg.equals(AMAZON) && !AMAZON.equals(fg);
+                  boolean entered = pkg.equals(AMAZON) && !AMAZON.equals(fg);
                   fg = pkg;
-                  if (!enteredAmazon || launch == null || !redirect) return;
+                  if (!entered) return;
           
-                  lastInfo = cls;
+                  reload();
+                  if (launch == null || !redirect) return;
+                  if (!cls.equals(lastCls)) { lastCls = cls; Cfg.writeLast(this, cls); }
                   showCover();
                   try {
                       startActivity(launch);
                   } catch (Exception ex) {
                       removeCover();
-                      reload();
+                      stamp = -1;                         // forzar a re-resolver el destino
                   }
               }
           
-              /** Pantalla de carga solo en Fire OS 7 (API < 30). */
+              /** Pantalla de carga solo en Fire OS 7 (API < 30). Se dibuja por software. */
               private void showCover() {
                   if (Build.VERSION.SDK_INT >= 30 || cover != null) return;
                   try {
@@ -275,8 +341,8 @@ jobs:
               }
           
               private void removeCover() {
-                  h.removeCallbacks(hideCover);
                   if (cover == null) return;
+                  h.removeCallbacks(hideCover);
                   try { ((WindowManager) getSystemService(WINDOW_SERVICE)).removeView(cover); }
                   catch (Exception ignored) { }
                   cover = null;
@@ -286,7 +352,6 @@ jobs:
           
               @Override public void onDestroy() {
                   removeCover();
-                  if (instance == this) instance = null;
                   super.onDestroy();
               }
           }
@@ -298,10 +363,12 @@ jobs:
           import android.app.Activity;
           import android.content.ComponentName;
           import android.content.Intent;
-          import android.content.SharedPreferences;
           import android.content.pm.PackageManager;
           import android.content.pm.ResolveInfo;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.Process;
           import android.provider.Settings;
           import android.widget.ArrayAdapter;
           import android.widget.Button;
@@ -317,17 +384,27 @@ jobs:
           import java.util.List;
           import java.util.Set;
           
+          /** Pantalla de configuración. Vive en su propio proceso (:ui) y se cierra del todo al salir. */
           public class MainActivity extends Activity {
+              private static volatile boolean open;
+          
               private TextView status;
               private ArrayAdapter<String> adapter;
+              private String target;
+              private boolean redirect, boot;
               private final List<ResolveInfo> apps = new ArrayList<>();
               private final List<String> names = new ArrayList<>();
               private final List<String> labels = new ArrayList<>();
           
               @Override protected void onCreate(Bundle b) {
                   super.onCreate(b);
-                  PackageManager pm = getPackageManager();
+                  open = true;
+                  Cfg cfg = Cfg.read(this);
+                  target = cfg.target;
+                  redirect = cfg.redirect;
+                  boot = cfg.boot;
           
+                  PackageManager pm = getPackageManager();
                   Set<String> seen = new HashSet<>();
                   for (String cat : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
                       Intent q = new Intent(Intent.ACTION_MAIN).addCategory(cat);
@@ -356,8 +433,17 @@ jobs:
                   enable.setOnClickListener(v -> enableService());
                   root.addView(enable);
           
-                  root.addView(check("Redirigir el botón Home", "redirect", true));
-                  root.addView(check("Abrir mi launcher al encender", "boot", false));
+                  CheckBox cr = new CheckBox(this);
+                  cr.setText("Redirigir el botón Home");
+                  cr.setChecked(redirect);
+                  cr.setOnCheckedChangeListener((v, on) -> { redirect = on; save(); });
+                  root.addView(cr);
+          
+                  CheckBox cb = new CheckBox(this);
+                  cb.setText("Abrir mi launcher al encender");
+                  cb.setChecked(boot);
+                  cb.setOnCheckedChangeListener((v, on) -> { boot = on; save(); });
+                  root.addView(cb);
           
                   TextView hint = new TextView(this);
                   hint.setText("Elige tu launcher:");
@@ -368,26 +454,27 @@ jobs:
                   ListView list = new ListView(this);
                   list.setAdapter(adapter);
                   list.setOnItemClickListener((parent, v, pos, id) -> {
-                      HomeService.sp(this).edit()
-                              .putString("target", apps.get(pos).activityInfo.packageName).apply();
-                      HomeService.refresh();
+                      target = apps.get(pos).activityInfo.packageName;
+                      save();
                       refreshStatus();
                   });
                   root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1f));
                   setContentView(root);
               }
           
+              private void save() { Cfg.write(this, target, redirect, boot); }
+          
               @Override protected void onResume() { super.onResume(); refreshStatus(); }
           
-              private CheckBox check(String text, String key, boolean def) {
-                  CheckBox cb = new CheckBox(this);
-                  cb.setText(text);
-                  cb.setChecked(HomeService.sp(this).getBoolean(key, def));
-                  cb.setOnCheckedChangeListener((v, on) -> {
-                      HomeService.sp(this).edit().putBoolean(key, on).apply();
-                      HomeService.refresh();
-                  });
-                  return cb;
+              /** Al salir de la pantalla se cierra y libera toda su memoria. */
+              @Override protected void onStop() { super.onStop(); finish(); }
+          
+              @Override protected void onDestroy() {
+                  super.onDestroy();
+                  open = false;
+                  new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                      if (!open) Process.killProcess(Process.myPid());
+                  }, 500);
               }
           
               private boolean serviceOn() {
@@ -398,16 +485,14 @@ jobs:
               }
           
               private void refreshStatus() {
-                  SharedPreferences s = HomeService.sp(this);
-                  String t = s.getString("target", null);
                   String name = "(sin elegir)";
                   for (int i = 0; i < apps.size(); i++) {
-                      boolean sel = apps.get(i).activityInfo.packageName.equals(t);
+                      boolean sel = apps.get(i).activityInfo.packageName.equals(target);
                       labels.set(i, sel ? "✓  " + names.get(i) : names.get(i));
                       if (sel) name = names.get(i);
                   }
                   adapter.notifyDataSetChanged();
-                  String li = HomeService.lastInfo;
+                  String li = Cfg.readLast(this);
                   status.setText("Servicio: " + (serviceOn() ? "ACTIVO" : "apagado")
                           + "\nDestino: " + name
                           + "\nÚltimo Home detectado: " + (li == null ? "(ninguno aún)" : li));
@@ -432,11 +517,15 @@ jobs:
               }
           }
           EOF
+      - name: Clave de firma fija
+        run: echo "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" | base64 -d > proj/app/my.p12
       - name: Compilar
         run: |
           cd proj
-          gradle assembleDebug
+          gradle assembleRelease || gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: home-redirect-apk
-          path: proj/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            proj/app/build/outputs/apk/release/app-release.apk
+            proj/app/build/outputs/apk/debug/app-debug.apk
