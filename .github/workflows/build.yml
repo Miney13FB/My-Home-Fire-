@@ -44,8 +44,8 @@ jobs:
                   applicationId 'dev.homeredirect'
                   minSdk 21
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -57,10 +57,12 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
               <uses-feature android:name="android.software.leanback" android:required="false" />
               <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+          
               <queries>
                   <intent>
                       <action android:name="android.intent.action.MAIN" />
@@ -71,11 +73,13 @@ jobs:
                       <category android:name="android.intent.category.LAUNCHER" />
                   </intent>
               </queries>
+          
               <application
                   android:label="@string/app_name"
                   android:icon="@android:drawable/sym_def_app_icon"
                   android:banner="@android:drawable/sym_def_app_icon"
                   android:allowBackup="false">
+          
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -83,6 +87,7 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+          
                   <service
                       android:name=".HomeService"
                       android:exported="true"
@@ -95,6 +100,7 @@ jobs:
                           android:name="android.accessibilityservice"
                           android:resource="@xml/accessibility_config" />
                   </service>
+          
                   <receiver android:name=".BootReceiver" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -119,18 +125,15 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:notificationTimeout="0"
               android:canRetrieveWindowContent="false"
-              android:packageNames="com.amazon.tv.launcher"
               android:description="@string/service_desc" />
           EOF
 
-          P=app/src/main/java/dev/homeredirect
-
-          cat > $P/Prefs.java <<'EOF'
+          cat > app/src/main/java/dev/homeredirect/Prefs.java <<'EOF'
           package dev.homeredirect;
-
+          
           import android.content.Context;
           import android.content.SharedPreferences;
-
+          
           final class Prefs {
               private static SharedPreferences sp(Context c) {
                   return c.getSharedPreferences("p", Context.MODE_PRIVATE);
@@ -142,14 +145,15 @@ jobs:
           }
           EOF
 
-          cat > $P/Launcher.java <<'EOF'
+          cat > app/src/main/java/dev/homeredirect/Launcher.java <<'EOF'
           package dev.homeredirect;
-
+          
           import android.content.Context;
           import android.content.Intent;
           import android.content.pm.PackageManager;
-
+          
           final class Launcher {
+              /** Abre el paquete destino. Devuelve false si no se pudo. */
               static boolean open(Context c, String pkg) {
                   if (pkg == null) return false;
                   PackageManager pm = c.getPackageManager();
@@ -164,13 +168,13 @@ jobs:
           }
           EOF
 
-          cat > $P/BootReceiver.java <<'EOF'
+          cat > app/src/main/java/dev/homeredirect/BootReceiver.java <<'EOF'
           package dev.homeredirect;
-
+          
           import android.content.BroadcastReceiver;
           import android.content.Context;
           import android.content.Intent;
-
+          
           public class BootReceiver extends BroadcastReceiver {
               @Override public void onReceive(Context c, Intent i) {
                   if (Prefs.flag(c, "boot", false)) Launcher.open(c, Prefs.target(c));
@@ -178,75 +182,104 @@ jobs:
           }
           EOF
 
-          cat > $P/HomeService.java <<'EOF'
+          cat > app/src/main/java/dev/homeredirect/HomeService.java <<'EOF'
           package dev.homeredirect;
-
+          
           import android.accessibilityservice.AccessibilityService;
-          import android.accessibilityservice.AccessibilityServiceInfo;
-          import android.graphics.Color;
           import android.graphics.PixelFormat;
           import android.os.Build;
           import android.os.Handler;
           import android.os.Looper;
           import android.os.SystemClock;
-          import android.view.View;
+          import android.view.Gravity;
           import android.view.WindowManager;
           import android.view.accessibility.AccessibilityEvent;
-
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.TextView;
+          
+          /**
+           * Redirige Home: cuando el launcher de Amazon PASA a primer plano (viene de otra app),
+           * abre el launcher elegido. Si Amazon ya estaba delante, no hace nada (así su Home
+           * sigue usable). No lee el contenido de la pantalla.
+           */
           public class HomeService extends AccessibilityService {
               static final String AMAZON = "com.amazon.tv.launcher";
-              private static final long DOUBLE_PRESS_MS = 1500;
-              private static final long COVER_MAX_MS = 6000;
-
-              static HomeService instance;
-
+              private static final long COVER_MAX_MS = 8000;   // Fire OS 7 retiene el arranque hasta ~5 s
+          
+              static volatile HomeService instance;
+              static volatile long pauseUntil;      // el botón "Abrir Home de Amazon" pausa la redirección unos segundos
+              static volatile String lastInfo;      // última redirección, para diagnóstico en la pantalla de la app
+          
               private final Handler h = new Handler(Looper.getMainLooper());
               private final Runnable hideCover = this::removeCover;
-              private long lastRedirect;
-              private View cover;
-
+              private String target;
+              private boolean redirect = true;
+              private String fg;                    // paquete que estaba delante
+              private LinearLayout cover;
+          
               @Override protected void onServiceConnected() {
                   instance = this;
-                  refresh();
+                  reload();
               }
-
+          
               static void refresh() {
                   HomeService s = instance;
-                  if (s == null) return;
-                  String t = Prefs.target(s);
-                  AccessibilityServiceInfo info = s.getServiceInfo();
-                  if (info == null) return;
-                  info.packageNames = (t == null) ? new String[]{AMAZON} : new String[]{AMAZON, t};
-                  s.setServiceInfo(info);
+                  if (s != null) s.reload();
               }
-
+          
+              private void reload() {
+                  target = Prefs.target(this);
+                  redirect = Prefs.flag(this, "redirect", true);
+              }
+          
               @Override public void onAccessibilityEvent(AccessibilityEvent e) {
-                  if (e.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                          || e.getPackageName() == null) return;
-                  String pkg = e.getPackageName().toString();
-                  String target = Prefs.target(this);
-                  if (target == null) return;
-
-                  if (pkg.equals(target)) { removeCover(); return; }
-                  if (!pkg.equals(AMAZON) || !Prefs.flag(this, "redirect", true)) return;
-
-                  long now = SystemClock.uptimeMillis();
-                  if (now - lastRedirect < DOUBLE_PRESS_MS) {
-                      lastRedirect = 0;
+                  CharSequence p = e.getPackageName();
+                  if (p == null) return;
+                  String pkg = p.toString();
+          
+                  if (pkg.equals(target)) {            // ya apareció el destino
+                      fg = pkg;
                       removeCover();
                       return;
                   }
-                  lastRedirect = now;
+          
+                  CharSequence c = e.getClassName();
+                  String cls = c == null ? "" : c.toString();
+                  // Ventanas de relleno (toasts, diálogos, overlays) no cuentan como cambio de app
+                  if (cls.startsWith("android.") || cls.startsWith("androidx.")
+                          || pkg.equals("com.android.systemui") || pkg.equals("android")) return;
+          
+                  boolean enteredAmazon = pkg.equals(AMAZON) && !AMAZON.equals(fg);
+                  fg = pkg;
+                  if (!enteredAmazon || target == null || !redirect) return;
+                  if (SystemClock.uptimeMillis() < pauseUntil) return;
+          
+                  lastInfo = cls;
                   showCover();
                   if (!Launcher.open(this, target)) removeCover();
               }
-
+          
+              /** Pantalla de carga solo en Fire OS 7 (API < 30). */
               private void showCover() {
                   if (Build.VERSION.SDK_INT >= 30 || cover != null) return;
                   try {
                       WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-                      View v = new View(this);
-                      v.setBackgroundColor(Color.BLACK);
+                      LinearLayout box = new LinearLayout(this);
+                      box.setOrientation(LinearLayout.VERTICAL);
+                      box.setGravity(Gravity.CENTER);
+                      box.setBackgroundColor(0xFF1B1D22);
+          
+                      box.addView(new ProgressBar(this), new LinearLayout.LayoutParams(120, 120));
+          
+                      TextView t = new TextView(this);
+                      t.setText("Cargando...");
+                      t.setTextColor(0xFFFFFFFF);
+                      t.setTextSize(24);
+                      t.setGravity(Gravity.CENTER_HORIZONTAL);
+                      t.setPadding(0, 32, 0, 0);
+                      box.addView(t);
+          
                       WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                               WindowManager.LayoutParams.MATCH_PARENT,
                               WindowManager.LayoutParams.MATCH_PARENT,
@@ -255,12 +288,12 @@ jobs:
                                       | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                                       | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                               PixelFormat.OPAQUE);
-                      wm.addView(v, lp);
-                      cover = v;
+                      wm.addView(box, lp);
+                      cover = box;
                       h.postDelayed(hideCover, COVER_MAX_MS);
                   } catch (Exception ignored) { cover = null; }
               }
-
+          
               private void removeCover() {
                   h.removeCallbacks(hideCover);
                   if (cover == null) return;
@@ -268,9 +301,9 @@ jobs:
                   catch (Exception ignored) { }
                   cover = null;
               }
-
+          
               @Override public void onInterrupt() { }
-
+          
               @Override public void onDestroy() {
                   removeCover();
                   if (instance == this) instance = null;
@@ -279,15 +312,16 @@ jobs:
           }
           EOF
 
-          cat > $P/MainActivity.java <<'EOF'
+          cat > app/src/main/java/dev/homeredirect/MainActivity.java <<'EOF'
           package dev.homeredirect;
-
+          
           import android.app.Activity;
           import android.content.ComponentName;
           import android.content.Intent;
           import android.content.pm.PackageManager;
           import android.content.pm.ResolveInfo;
           import android.os.Bundle;
+          import android.os.SystemClock;
           import android.provider.Settings;
           import android.widget.ArrayAdapter;
           import android.widget.Button;
@@ -296,60 +330,71 @@ jobs:
           import android.widget.ListView;
           import android.widget.TextView;
           import android.widget.Toast;
-
+          
           import java.util.ArrayList;
           import java.util.Collections;
           import java.util.HashSet;
           import java.util.List;
           import java.util.Set;
-
+          
           public class MainActivity extends Activity {
               private static final String ADB_CMD =
-                      "adb shell pm grant dev.homeredirect android.permission.WRITE_SECURE_SETTINGS";
+                      "pm grant dev.homeredirect android.permission.WRITE_SECURE_SETTINGS";
               private TextView status;
+              private ArrayAdapter<String> adapter;
               private final List<ResolveInfo> apps = new ArrayList<>();
-
+              private final List<String> names = new ArrayList<>();
+              private final List<String> labels = new ArrayList<>();
+          
               @Override protected void onCreate(Bundle b) {
                   super.onCreate(b);
                   PackageManager pm = getPackageManager();
-
+          
                   Set<String> seen = new HashSet<>();
                   for (String cat : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
                       Intent q = new Intent(Intent.ACTION_MAIN).addCategory(cat);
                       for (ResolveInfo ri : pm.queryIntentActivities(q, 0)) {
-                          String p = ri.activityInfo.packageName;
-                          if (!p.equals(getPackageName()) && seen.add(p)) apps.add(ri);
+                          String pk = ri.activityInfo.packageName;
+                          if (!pk.equals(getPackageName()) && seen.add(pk)) apps.add(ri);
                       }
                   }
                   Collections.sort(apps, (a, c) ->
                           a.loadLabel(pm).toString().compareToIgnoreCase(c.loadLabel(pm).toString()));
-                  List<String> labels = new ArrayList<>();
-                  for (ResolveInfo ri : apps) labels.add(ri.loadLabel(pm).toString());
-
+                  for (ResolveInfo ri : apps) {
+                      names.add(ri.loadLabel(pm).toString());
+                      labels.add("");
+                  }
+          
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
                   root.setPadding(48, 32, 48, 32);
-
+          
                   status = new TextView(this);
                   status.setTextSize(18);
                   root.addView(status);
-
+          
                   Button enable = new Button(this);
                   enable.setText("Activar servicio");
                   enable.setOnClickListener(v -> enableService());
                   root.addView(enable);
-
+          
+                  Button amazon = new Button(this);
+                  amazon.setText("Abrir Home de Amazon");
+                  amazon.setOnClickListener(v -> openAmazonHome());
+                  root.addView(amazon);
+          
                   root.addView(check("Redirigir el botón Home", "redirect", true));
                   root.addView(check("Abrir mi launcher al encender", "boot", false));
-
+          
                   TextView hint = new TextView(this);
                   hint.setText("Elige tu launcher:");
                   hint.setTextSize(16);
                   root.addView(hint);
-
+          
+                  adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, labels);
                   ListView list = new ListView(this);
-                  list.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, labels));
-                  list.setOnItemClickListener((p, v, pos, id) -> {
+                  list.setAdapter(adapter);
+                  list.setOnItemClickListener((parent, v, pos, id) -> {
                       Prefs.setTarget(this, apps.get(pos).activityInfo.packageName);
                       HomeService.refresh();
                       refreshStatus();
@@ -357,30 +402,54 @@ jobs:
                   root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1f));
                   setContentView(root);
               }
-
+          
               @Override protected void onResume() { super.onResume(); refreshStatus(); }
-
+          
               private CheckBox check(String text, String key, boolean def) {
                   CheckBox c = new CheckBox(this);
                   c.setText(text);
                   c.setChecked(Prefs.flag(this, key, def));
-                  c.setOnCheckedChangeListener((v, on) -> Prefs.setFlag(this, key, on));
+                  c.setOnCheckedChangeListener((v, on) -> {
+                      Prefs.setFlag(this, key, on);
+                      HomeService.refresh();
+                  });
                   return c;
               }
-
+          
               private boolean serviceOn() {
                   String s = Settings.Secure.getString(getContentResolver(),
                           Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
                   ComponentName cn = new ComponentName(this, HomeService.class);
                   return s != null && (s.contains(cn.flattenToString()) || s.contains(cn.flattenToShortString()));
               }
-
+          
               private void refreshStatus() {
                   String t = Prefs.target(this);
+                  String li = HomeService.lastInfo;
+                  String name = "(sin elegir)";
+                  for (int i = 0; i < apps.size(); i++) {
+                      boolean sel = apps.get(i).activityInfo.packageName.equals(t);
+                      labels.set(i, sel ? "✓  " + names.get(i) : names.get(i));
+                      if (sel) name = names.get(i);
+                  }
+                  adapter.notifyDataSetChanged();
                   status.setText("Servicio: " + (serviceOn() ? "ACTIVO" : "apagado")
-                          + "\nDestino: " + (t == null ? "(sin elegir)" : t));
+                          + "\nDestino: " + name
+                          + "\nÚltimo Home detectado: " + (li == null ? "(ninguno aún)" : li));
               }
-
+          
+              private void openAmazonHome() {
+                  HomeService.pauseUntil = SystemClock.uptimeMillis() + 6000;
+                  try {
+                      startActivity(new Intent(Intent.ACTION_MAIN)
+                              .addCategory(Intent.CATEGORY_HOME)
+                              .setPackage(HomeService.AMAZON)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                  } catch (Exception e) {
+                      Toast.makeText(this, "No se pudo abrir el Home de Amazon", Toast.LENGTH_LONG).show();
+                  }
+              }
+          
               private void enableService() {
                   try {
                       String flat = new ComponentName(this, HomeService.class).flattenToString();
@@ -393,7 +462,7 @@ jobs:
                       Settings.Secure.putInt(getContentResolver(), Settings.Secure.ACCESSIBILITY_ENABLED, 1);
                       refreshStatus();
                   } catch (SecurityException e) {
-                      Toast.makeText(this, "Falta el permiso. Ejecuta en el PC:\n" + ADB_CMD,
+                      Toast.makeText(this, "Falta el permiso. En el shell escribe:\n" + ADB_CMD,
                               Toast.LENGTH_LONG).show();
                       try { startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
                       catch (Exception ignored) { }
